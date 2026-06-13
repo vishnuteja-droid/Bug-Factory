@@ -16,11 +16,19 @@ ticket (JSON)  →  Intake  →  Localize  →  Plan  →  Code  →  Validate  
                              LLM pick)            edit)     red→green)    description)
 ```
 
-The spine is the **red→green gate**: the factory first runs the suite to confirm
-the bug reproduces, applies a fix, and accepts it **only when the failing test
-passes and the rest of the suite stays green**. The model only makes small,
-bounded choices; deterministic code does localization and validation — which is
-what makes a 1B model viable.
+The spine is the **red→green gate** (the same idea SWE-bench uses): the factory
+runs the suite a few times to confirm the bug reproduces **stably** (flaky
+failures are filtered out), applies a fix, and accepts it **only when the
+ticket's failing test now passes AND no previously-green test regresses**. The
+model only makes small, bounded choices; deterministic code does localization
+and validation — which is what makes a 1B model viable.
+
+**Localization scales without a vector DB.** Suspects are ranked by combining
+(1) stack-trace frames in the ticket, (2) whole-word symbol-name matches, and
+(3) lexical hits in function bodies. The model picks from the shortlist; if its
+top suspect can't be fixed, the pipeline **falls back to the next candidate**.
+Fixes work on module-level functions *and* class methods (`Cart.total`),
+re-indented to drop cleanly back into place.
 
 The LLM is pluggable behind one interface (`bugfactory/llm/base.py`). Today:
 `ollama` (real) and `mock` (deterministic, no server needed). Adding OpenAI,
@@ -39,22 +47,28 @@ uvicorn ui.server:app --reload          # UI at http://localhost:8000
 
 # 2) No model server (verify the harness anywhere)
 python run_demo.py --provider mock
+python run_demo.py --provider mock --ticket tickets/BUG-202.json   # class-method fix
 PROVIDER=mock uvicorn ui.server:app --reload
+
+# factory self-tests (run anywhere, no model server)
+python -m pytest -q
 ```
 
-Outputs (the proposed diff + MR description) land in `output/`.
+Outputs (the proposed diff, MR description, and a full event log) land in `output/`.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `sample_repo/` | dummy repo with a real bug + pytest suite |
-| `tickets/` | input bug tickets (`BUG-101.json`) |
-| `bugfactory/llm/` | provider-agnostic LLM interface + adapters |
-| `bugfactory/codebase/` | repo map (`ast`) + safe function editing |
+| `sample_repo/` | dummy repo with two real bugs (a function + a class method) + pytest suite |
+| `tickets/` | input bug tickets (`BUG-101`, `BUG-202` with a stack trace) |
+| `bugfactory/llm/` | provider-agnostic LLM interface + Ollama/Mock adapters |
+| `bugfactory/codebase/` | repo map, function/method editing, stack-trace + lexical search |
 | `bugfactory/sandbox/` | runs the suite in a subprocess (Docker slots in here at scale) |
-| `bugfactory/agents.py` | intake / localize / plan / code / review steps |
-| `bugfactory/pipeline.py` | orchestrator; emits a stream of events |
+| `bugfactory/agents.py` | intake / rank+choose / plan / code / review steps |
+| `bugfactory/pipeline.py` | orchestrator; emits a stream of events; persists a run log |
+| `bugfactory/config.py` | run configuration (env-overridable) |
+| `tests/` | factory self-tests (mock-driven, run anywhere) |
 | `ui/` | FastAPI + single-page live view (SSE) |
 
 ## Roadmap

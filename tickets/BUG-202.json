@@ -1,0 +1,7 @@
+{
+  "key": "BUG-202",
+  "title": "Cart.total() does not apply tax",
+  "description": "Order totals are missing tax. For a cart with subtotal 100 and a tax_rate of 0.25 we expect 125, but total() returns 100. The tax is never applied.\n\nFailing test traceback:\n  File \"tests/test_orders.py\", line 11, in test_total_applies_tax\n    assert cart.total(0.25) == 125\n  File \"src/orders.py\", line 13, in total\n    return self.subtotal()\nAssertionError: 100 != 125",
+  "labels": ["bug", "orders", "billing"],
+  "reporter": "qa-team"
+}

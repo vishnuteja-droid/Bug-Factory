@@ -9,7 +9,10 @@ MockProvider can play each role.
 from __future__ import annotations
 
 import json
+import os
 import re
+
+from .codebase import lexical_hits, parse_stack_trace
 
 
 def _extract_json(text: str) -> dict | None:
@@ -23,56 +26,74 @@ def _extract_json(text: str) -> dict | None:
 
 
 def _extract_code(text: str) -> str:
-    """Pull a code block out of model output, tolerating missing fences."""
     fence = re.search(r"```(?:python)?\s*(.*?)```", text, re.DOTALL)
     body = fence.group(1) if fence else text
     return body.strip("\n")
 
 
 def intake(provider, ticket: dict) -> dict:
-    """Summarize the ticket and extract search keywords."""
     system = (
         "[role:intake] You triage bug tickets. Read the ticket and reply with a "
         'JSON object: {"summary": "<one sentence>", "keywords": ["<identifier-like terms>"]}. '
-        "Keywords should be function or symbol names likely to appear in the code."
+        "Keywords should be function, class, or symbol names likely to appear in the code."
     )
     prompt = f"Title: {ticket.get('title','')}\nDescription: {ticket.get('description','')}"
     resp = provider.complete(system, prompt)
     parsed = _extract_json(resp.text) or {}
 
     keywords = [str(k).lower() for k in parsed.get("keywords", []) if isinstance(k, (str, int))]
-    if not keywords:
-        # Deterministic fallback: identifier-ish tokens straight from the ticket text.
-        keywords = list({w.lower() for w in re.findall(r"[A-Za-z_]{3,}", prompt)})
+    # Always augment with identifier-ish tokens from the ticket (robust for tiny models).
+    keywords += [w.lower() for w in re.findall(r"[A-Za-z_]{3,}", prompt)]
+    keywords = list(dict.fromkeys(keywords))  # de-dup, keep order
     summary = parsed.get("summary") or ticket.get("title", "")
     return {"summary": summary, "keywords": keywords, "raw": resp.text}
 
 
-def localize(provider, ticket: dict, keywords: list[str], repo_map: list) -> tuple[object, list]:
-    """Score functions by name-overlap with the ticket, then let the model pick
-    from the top candidates. Returns (chosen RepoFunction, ranked candidates)."""
-    haystack = (ticket.get("title", "") + " " + ticket.get("description", "") + " " + " ".join(keywords)).lower()
+def rank_candidates(ticket: dict, keywords: list[str], repo_map: list, max_candidates: int = 5) -> list:
+    """Deterministic, scalable localization: combine stack-trace, symbol-name,
+    and lexical signals into a ranked list of source (non-test) functions."""
+    text = (ticket.get("title", "") + " " + ticket.get("description", "") + " " + " ".join(keywords)).lower()
+    frames = parse_stack_trace(ticket.get("title", "") + "\n" + ticket.get("description", ""))
+    source_fns = [fn for fn in repo_map if not fn.is_test]
 
     scored = []
-    for fn in repo_map:
-        score = haystack.count(fn.function.lower())
-        if score:
+    for fn in source_fns:
+        score = 0.0
+        # whole-word match so "add" is not credited for "adding", "total" not for "subtotal"
+        name_hits = len(re.findall(r"\b" + re.escape(fn.name.lower()) + r"\b", text))
+        score += 10 * name_hits                                  # symbol name in ticket
+        score += lexical_hits(fn.source(), keywords)             # ticket terms in body
+        for fr in frames:                                        # stack-trace frames (strongest)
+            same_file = os.path.basename(fr["file"]) == os.path.basename(fn.file)
+            if fr["func"] and fr["func"] == fn.name and same_file:
+                score += 100
+            elif fr["func"] and fr["func"] == fn.name:
+                score += 50
+            elif same_file:
+                score += 15
+        if score > 0:
             scored.append((score, fn))
-    scored.sort(key=lambda t: t[0], reverse=True)
-    candidates = [fn for _, fn in scored] or list(repo_map)
-    top = candidates[:5]
 
+    scored.sort(key=lambda t: t[0], reverse=True)
+    ranked = [fn for _, fn in scored]
+    if not ranked:                                               # nothing matched: fall back to all source
+        ranked = source_fns
+    return ranked[:max_candidates]
+
+
+def choose_candidate(provider, ticket: dict, candidates: list):
+    """Let the model pick the single most likely culprit from the shortlist."""
+    if len(candidates) == 1:
+        return candidates[0]
     system = (
         "[role:localize] You locate the function responsible for a bug. "
-        "Reply with ONLY the name of the single most likely function from the list."
+        "Reply with ONLY the qualified name of the single most likely culprit from the list."
     )
-    listing = "\n".join(f"- {fn.function}  ({fn.file})" for fn in top)
-    prompt = f"Bug: {ticket.get('title','')}\n{ticket.get('description','')}\n\nCandidate functions:\n{listing}"
+    listing = "\n".join(f"- {fn.qualname}  ({fn.file})\n{fn.snippet(8)}" for fn in candidates)
+    prompt = f"Bug: {ticket.get('title','')}\n{ticket.get('description','')}\n\nCandidates:\n{listing}"
     resp = provider.complete(system, prompt)
-
     pick = resp.text.strip().split()[0].strip("`(),.") if resp.text.strip() else ""
-    chosen = next((fn for fn in top if fn.function == pick), top[0])
-    return chosen, top
+    return next((fn for fn in candidates if fn.qualname == pick), candidates[0])
 
 
 def plan(provider, ticket: dict, target, func_src: str) -> str:
@@ -82,14 +103,13 @@ def plan(provider, ticket: dict, target, func_src: str) -> str:
     )
     prompt = (
         f"Ticket: {ticket.get('description','')}\n\n"
-        f"Buggy function `{target.function}` in {target.file}:\n{func_src}"
+        f"Buggy `{target.qualname}` in {target.file}:\n{func_src}"
     )
     resp = provider.complete(system, prompt)
-    return resp.text.strip() or f"Fix the {target.function} function per the ticket."
+    return resp.text.strip() or f"Fix {target.qualname} per the ticket."
 
 
 def code_fix(provider, ticket: dict, target, func_src: str, last_error: str | None = None) -> str:
-    """Return corrected source for the single target function."""
     system = (
         "[role:code] You fix bugs. Rewrite the given Python function so it is "
         "correct. Reply with ONLY the corrected function in a ```python code block. "
@@ -97,7 +117,7 @@ def code_fix(provider, ticket: dict, target, func_src: str, last_error: str | No
     )
     prompt = (
         f"Ticket: {ticket.get('description','')}\n\n"
-        f"Function to fix:\n```python\n{func_src}\n```"
+        f"Function to fix (`{target.qualname}`):\n```python\n{func_src}\n```"
     )
     if last_error:
         prompt += f"\n\nYour previous attempt still failed tests:\n{last_error}\nTry again."
