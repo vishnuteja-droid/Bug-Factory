@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bug Factory</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#c9d1d9;
+          --muted:#8b949e; --ok:#3fb950; --err:#f85149; --info:#58a6ff; --accent:#bc8cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+         background:var(--bg); color:var(--text); }
+  header { padding:18px 24px; border-bottom:1px solid var(--border);
+           display:flex; align-items:center; gap:16px; }
+  h1 { font-size:18px; margin:0; }
+  .pill { font-size:12px; color:var(--muted); border:1px solid var(--border);
+          padding:3px 8px; border-radius:20px; }
+  button { background:var(--accent); color:#0d1117; border:0; padding:9px 18px;
+           border-radius:6px; font-weight:600; cursor:pointer; font-family:inherit; }
+  button:disabled { opacity:.5; cursor:default; }
+  main { display:grid; grid-template-columns:1fr 1fr; gap:16px; padding:24px; }
+  .col h2 { font-size:13px; color:var(--muted); text-transform:uppercase;
+            letter-spacing:.5px; margin:0 0 10px; }
+  .stage { border:1px solid var(--border); background:var(--panel); border-radius:8px;
+           padding:12px 14px; margin-bottom:10px; opacity:.45; transition:opacity .2s; }
+  .stage.active { opacity:1; border-color:var(--info); }
+  .stage.success { opacity:1; border-color:var(--ok); }
+  .stage.error { opacity:1; border-color:var(--err); }
+  .stage .name { font-weight:700; text-transform:capitalize; }
+  .stage .msg { color:var(--muted); font-size:13px; margin-top:4px; white-space:pre-wrap; }
+  .log { background:#010409; border:1px solid var(--border); border-radius:8px;
+         padding:12px; height:180px; overflow:auto; font-size:12px; }
+  .log .l { margin:2px 0; }
+  .s-start { color:var(--info); } .s-info { color:var(--muted); }
+  .s-success { color:var(--ok); } .s-error { color:var(--err); }
+  pre { background:#010409; border:1px solid var(--border); border-radius:8px;
+        padding:12px; overflow:auto; font-size:12px; max-height:340px; }
+  .diff .add { color:var(--ok); } .diff .del { color:var(--err); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🏭 Bug Factory</h1>
+  <span class="pill" id="meta">idle</span>
+  <span style="flex:1"></span>
+  <button id="run">Run BUG-101</button>
+</header>
+
+<main>
+  <section class="col">
+    <h2>Pipeline</h2>
+    <div id="stages"></div>
+    <h2 style="margin-top:18px">Event log</h2>
+    <div class="log" id="log"></div>
+  </section>
+  <section class="col">
+    <h2>Proposed Merge Request</h2>
+    <pre id="mr">Run the factory to produce a fix…</pre>
+    <h2 style="margin-top:18px">Diff</h2>
+    <pre class="diff" id="diff">—</pre>
+  </section>
+</main>
+
+<script>
+const STAGES = ["intake","localize","plan","code","validate","review","mr","done"];
+const stagesEl = document.getElementById("stages");
+const logEl = document.getElementById("log");
+const cards = {};
+
+function reset() {
+  stagesEl.innerHTML = ""; logEl.innerHTML = "";
+  document.getElementById("mr").textContent = "Working…";
+  document.getElementById("diff").textContent = "—";
+  for (const s of STAGES) {
+    const d = document.createElement("div");
+    d.className = "stage"; d.id = "stage-" + s;
+    d.innerHTML = `<div class="name">${s}</div><div class="msg"></div>`;
+    stagesEl.appendChild(d); cards[s] = d;
+  }
+}
+
+function renderDiff(text) {
+  const el = document.getElementById("diff");
+  el.innerHTML = "";
+  for (const line of text.split("\n")) {
+    const span = document.createElement("div");
+    if (line.startsWith("+") && !line.startsWith("+++")) span.className = "add";
+    else if (line.startsWith("-") && !line.startsWith("---")) span.className = "del";
+    span.textContent = line; el.appendChild(span);
+  }
+}
+
+document.getElementById("run").onclick = () => {
+  reset();
+  const btn = document.getElementById("run"); btn.disabled = true;
+  const es = new EventSource("/api/stream?ticket=BUG-101");
+
+  es.addEventListener("meta", (e) => {
+    const m = JSON.parse(e.data);
+    document.getElementById("meta").textContent = `${m.provider} · ${m.model}`;
+  });
+
+  es.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    const card = cards[ev.stage];
+    if (card) {
+      card.className = "stage " + (ev.status === "success" ? "success"
+                       : ev.status === "error" ? "error" : "active");
+      card.querySelector(".msg").textContent = ev.message;
+    }
+    const line = document.createElement("div");
+    line.className = "l s-" + ev.status;
+    line.textContent = `[${ev.stage}] ${ev.message}`;
+    logEl.appendChild(line); logEl.scrollTop = logEl.scrollHeight;
+
+    if (ev.stage === "mr" && ev.data.description) {
+      document.getElementById("mr").textContent = ev.data.description;
+      if (ev.data.diff) renderDiff(ev.data.diff);
+    }
+    if (ev.stage === "done") { es.close(); btn.disabled = false; }
+  };
+
+  es.onerror = () => { es.close(); btn.disabled = false; };
+};
+</script>
+</body>
+</html>

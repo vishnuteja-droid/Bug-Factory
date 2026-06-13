@@ -1,0 +1,7 @@
+{
+  "key": "BUG-101",
+  "title": "subtract() returns the wrong result",
+  "description": "Our calculator's subtraction is broken. Calling subtract(10, 3) returns 13, but it should return 7. It looks like subtraction is adding the two numbers instead of subtracting them. Please fix the subtract function.",
+  "labels": ["bug", "calculator"],
+  "reporter": "qa-team"
+}
